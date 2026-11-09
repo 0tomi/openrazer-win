@@ -114,17 +114,6 @@ pub struct Snapshot {
     /// Why the daemon refused the last change to the programs Snap Tap stays
     /// out of. The panel shows it under the box, where the name was typed.
     pub snaptap_deny_error: Option<String>,
-    /// The last profile `profile.create` made, so the form that asked for it
-    /// can close -- and stay open, name and all, when it was refused.
-    pub created: Option<Created>,
-}
-
-/// A profile the daemon created: the `count`-th since Studio started.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Created {
-    pub count: u64,
-    pub serial: String,
-    pub name: String,
 }
 
 pub enum Command {
@@ -558,12 +547,11 @@ impl Worker {
             Command::SnapTap(params) => {
                 let deny = params.get("deny").is_some();
                 let result = self.with(|c| c.call("snaptap.set", params));
-                if !deny {
-                    self.report(&result, None);
-                }
+                // A refused program name is shown under its box, anything else as a toast.
+                let error = if deny { result.as_ref().err().map(ToString::to_string) } else { self.report(&result, None); None };
                 let mut shared = self.shared.lock().unwrap();
                 if deny {
-                    shared.snaptap_deny_error = result.as_ref().err().map(ToString::to_string);
+                    shared.snaptap_deny_error = error;
                 }
                 if let Ok(status) = result {
                     shared.snaptap = status;
@@ -573,7 +561,6 @@ impl Worker {
                 let method = format!("profile.{action}");
                 let result = self.with(|c| c.call(&method, json!({ "serial": serial, "name": name })));
                 let text = match action {
-                    "save" => tf("Profile “{}” created", &[&name]),
                     "load" => tf("Profile “{}” applied", &[&name]),
                     _ => tf("Profile “{}” deleted", &[&name]),
                 };
@@ -590,21 +577,12 @@ impl Worker {
                 }
             }
             Command::ProfileCreate { serial, name, source } => {
-                let mut params = json!({ "serial": serial, "name": name });
-                if let Some(source) = &source {
-                    params["source"] = json!(source);
-                }
-                let result = self.with(|c| c.call("profile.create", params));
+                let result = self.with(|c| c.call("profile.create", json!({ "serial": serial, "name": name, "source": source })));
                 self.report(&result, Some(tf("Profile “{}” created", &[&name])));
-                if result.is_ok() {
-                    let mut shared = self.shared.lock().unwrap();
-                    let count = shared.created.as_ref().map_or(0, |c| c.count) + 1;
-                    shared.created = Some(Created { count, serial: serial.clone(), name: name.clone() });
-                }
                 self.read_profiles(&serial);
-                if result.is_ok() {
-                    self.after_switch(&serial);
-                }
+                // Even after an error: the profile may have been made and
+                // switched to half way, and the page should show what is there.
+                self.after_switch(&serial);
             }
             Command::MacroSet { serial, key, action } => {
                 let result = self.with(|c| c.call("macro.set", json!({ "serial": serial, "key": key, "action": action })));
