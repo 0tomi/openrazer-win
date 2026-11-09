@@ -6,6 +6,33 @@ uses [semantic versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Keyswitch optimization** on the Razer Huntsman V2 and V2 Tenkeyless, as in
+  Synapse: *Typing* keeps a debounce delay, *Gaming* has none. `openrazer-win
+  keyswitch`, or *Performance* in Studio and the control panel.
+- **Snap Tap**, without Synapse: of two opposing keys, the one pressed last
+  wins. The daemon does it on the PC, for every keyboard. It is off until you
+  turn it on with `openrazer-win snaptap on` or under *Performance* in Studio,
+  after reading a warning: some games forbid it. So far it has only run
+  against simulated key events.
+- **Profiles that keep themselves.** The profile last created or applied is
+  the device's active one, and every later change is saved into it. Switching
+  profiles also sets the keyswitch mode, DPI, polling rate and, on keyboards,
+  Snap Tap, which a profile never turns on before its warning is accepted. A new
+  profile starts from the defaults, keeping the DPI and polling rate; Studio's
+  *Duplicate* copies one. `profile save` now makes the profile active, and
+  `profile` marks it with `*`; for clients, `profile.create` and `active`.
+
+### Fixed
+
+- **The daemon is ready sooner after sign-in.** It sets up USB devices before
+  listening for Bluetooth ones, and stops listening at once on a PC without a
+  Bluetooth radio, which used to cost about 6 seconds.
+- **Studio no longer waits on a daemon that is gone.** A stale `daemon.json`
+  is recognised at once, and Studio shows *Looking for devices…* instead of
+  "No Razer devices found" until the daemon's first search has finished.
+
 ## [1.6.1] - 2026-11-06
 
 ### Added

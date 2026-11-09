@@ -20,7 +20,9 @@ from ..core.manager import DeviceManager
 from ..core.persistence import Persistence
 from ..chroma import PORT as CHROMA_PORT
 from ..chroma import ChromaBridge, ChromaServer
-from ..core.profiles import ProfileError, ProfileStore, apply_profile, snapshot
+from ..core.profiles import (
+    ProfileError, ProfileStore, apply_profile, capture_current, default_state, snapshot,
+)
 from ..devices.recipes import NotSupported, RecipeError
 from ..effects.engine import EffectEngine, zone_order
 from ..integrations import AccentWatch, IntegrationSettings, read_accent
@@ -67,6 +69,7 @@ DEVICE_METHODS = {
     # keyboard
     'get_game_mode', 'set_game_mode', 'get_macro_mode', 'set_macro_mode',
     'set_macro_effect', 'set_fn_toggle', 'get_keyboard_layout',
+    'get_keyswitch_optimization', 'set_keyswitch_optimization',
     # misc
     'get_device_mode', 'set_device_mode', 'restore', 'available_effects',
 }
@@ -98,6 +101,12 @@ def _device_summary(device: RazerDevice) -> dict:
     }
 
 
+def _snaptap_applies(device) -> bool:
+    """Whether `device`'s profiles carry Snap Tap.  It acts on the keyboard as a
+    whole, so keyboards' only: the test Studio uses to show its Snap Tap panel."""
+    return device.capabilities().get('type') in ('keyboard', 'keypad')
+
+
 def _safe(device: RazerDevice, attribute: str) -> Any:
     try:
         return getattr(device, attribute)
@@ -113,24 +122,32 @@ class DaemonService:
                  profiles: Optional[ProfileStore] = None,
                  enable_keys: bool = False, keys=None, macros=None,
                  integrations: Optional[IntegrationSettings] = None,
-                 chroma_port: int = CHROMA_PORT):
+                 chroma_port: int = CHROMA_PORT, snaptap=None):
         self.persistence = persistence or Persistence()
         self.profiles = profiles if profiles is not None else ProfileStore()
         self.manager = DeviceManager(backend=backend, persistence=self.persistence)
         self.effects = (EffectEngine(self.manager, persistence=self.persistence)
                         if enable_effects else None)
         from ..keys import KeyService, MacroStore
+        from ..keys.snaptap import SnapTapSettings
+        from ..keys.snaptap_host import SnapTapHost
         #: Bindings can be edited whether or not keys are being handled.
         self.macros = macros if macros is not None else MacroStore()
         #: Off unless asked for: it installs a system-wide keyboard hook.
         self.keys = keys
         if self.keys is None and enable_keys:
             self.keys = KeyService(self.manager.backend, macros=self.macros)
+        #: Off until asked for, and it rides on the hook above when there is one.
+        self.snaptap = snaptap if snaptap is not None else SnapTapHost(
+            SnapTapSettings(os.path.join(os.path.dirname(self.persistence.path), 'snaptap.json')),
+            keys=self.keys)
         self.started_at = time.time()
         self._lock = threading.RLock()
         #: ``starting`` until the first scan and set-up have finished; the
         #: daemon answers requests long before that.
         self.state = 'starting'
+        #: True until the first poll has swept the radio, which comes after ``ready``.
+        self.first_sweep_pending = True
         #: Devices still waiting to be set up: device -> (attempts, retry at).
         self._pending: dict = {}
         #: Switched on and off by the user, and remembered beside the lighting.
@@ -148,7 +165,9 @@ class DaemonService:
     def start(self) -> None:
         if self.keys is not None:
             self.keys.start()
-        self.manager.scan()
+        self.snaptap.start()
+        # USB first: a sweep of the radio listens for seconds.  The first poll does it.
+        self.manager.scan(sweep_bluetooth=False)
         for device in self.manager.devices:
             self._initialise(device)
         if self.effects is not None:
@@ -200,6 +219,8 @@ class DaemonService:
             except Exception:  # noqa: BLE001 - shutting down regardless
                 logger.debug('could not hand %s back to its firmware', device.name,
                              exc_info=True)
+        # First: what it undoes lives on the thread of the hook stopped next.
+        self.snaptap.stop()
         if self.keys is not None:
             self.keys.stop()
         self.manager.close()
@@ -313,6 +334,24 @@ class DaemonService:
                 self._stop_chroma()
         return self.rpc_integration_status()
 
+    # -- Snap Tap ------------------------------------------------------------
+    def rpc_snaptap_status(self) -> dict:
+        return self.snaptap.status()
+
+    def rpc_snaptap_set(self, enabled: Optional[bool] = None, pairs=None, deny=None, allow=None,
+                        acknowledged: Optional[bool] = None) -> dict:
+        try:
+            self.snaptap.configure(enabled=enabled, pairs=pairs, deny=deny, allow=allow,
+                                   acknowledged=acknowledged)
+        except ValueError as error:     # SnapTapError
+            raise RpcError(INVALID_PARAMS, str(error)) from error
+        # Snap Tap belongs to no one device, so every keyboard following a
+        # profile takes the change into it.
+        for device in self.manager.devices:
+            if _snaptap_applies(device):
+                self._keep_in_profile(device)
+        return self.snaptap.status()
+
     # -- lookups -----------------------------------------------------------
     def _device(self, serial: str) -> RazerDevice:
         device = self.manager.by_serial(serial)
@@ -334,6 +373,8 @@ class DaemonService:
             'backend': self.manager.backend.name,
             'devices': len(self.manager.devices),
             'state': self.state,
+            #: Absent from older daemons, which Studio takes as False.
+            'first_sweep_pending': self.first_sweep_pending,
             #: Found, but not yet willing to take their settings.
             'pending': sorted(device.name for device in self._pending),
         }
@@ -374,6 +415,7 @@ class DaemonService:
             except (NotSupported, ValueError) as error:
                 raise RpcError(INVALID_PARAMS, str(error)) from error
             self.persistence.save()
+            self._keep_in_profile(device)
             return None
         if (self.effects is not None and method in HARDWARE_EFFECTS
                 and kwargs.get('zone', 'backlight') == 'backlight'):
@@ -384,9 +426,10 @@ class DaemonService:
             raise RpcError(NOT_SUPPORTED, str(error)) from error
         except (DeviceError, RecipeError) as error:
             raise RpcError(DEVICE_ERROR, str(error)) from error
-        except TypeError as error:
+        except (TypeError, ValueError) as error:
             raise RpcError(INVALID_PARAMS, str(error)) from error
         self.persistence.save()
+        self._keep_in_profile(device)
         return result
 
     def rpc_effect(self, serial: str, effect: str, options=None) -> dict:
@@ -400,6 +443,7 @@ class DaemonService:
         except ValueError as error:
             raise RpcError(INVALID_PARAMS, str(error)) from error
         self.persistence.save()
+        self._keep_in_profile(device)
         return result
 
     def rpc_effect_status(self) -> dict:
@@ -466,17 +510,81 @@ class DaemonService:
         return {'playing': str(key)}
 
     # -- profiles ----------------------------------------------------------
+    def _snapshot(self, device, new: bool = False) -> dict:
+        """What `device` has now, for a profile -- or, `new`, what a new one starts from."""
+        state = default_state(device, self.persistence) if new else snapshot(device, self.persistence)
+        if _snaptap_applies(device):
+            from ..keys.snaptap import DEFAULT_PAIRS
+            # A new profile never turns Snap Tap on, and has the pairs a first start has.
+            settings = {'enabled': False, 'pairs': DEFAULT_PAIRS} if new else self.snaptap.status()
+            state['snaptap'] = {'enabled': settings['enabled'], 'pairs': settings['pairs']}
+        return state
+
+    def _keep_in_profile(self, device) -> None:
+        """Write what `device` has now into the profile it follows, if any: what
+        spares the user a save button.  Under the lock _switch holds, so that a
+        change made meanwhile cannot land, half of each, in the profile left."""
+        with self._lock:
+            if self.profiles.active(device.serial) is None:
+                return
+            try:
+                self.profiles.update_active(device.serial, self._snapshot(device))
+            except Exception:  # noqa: BLE001 - the change itself has been made
+                logger.warning('could not keep the profile of %s up to date', device.name,
+                               exc_info=True)
+
+    def _apply_snaptap(self, device, profile: dict) -> None:
+        stored = profile.get('snaptap')
+        if not stored or not _snaptap_applies(device):
+            return
+        # Never on through a profile until the warning has been accepted here:
+        # a file that says so is not someone reading it.  Without that, Snap
+        # Tap is off already, so turning it off changes nothing.
+        enabled = bool(stored.get('enabled')) and self.snaptap.status()['acknowledged']
+        try:
+            self.snaptap.configure(pairs=stored.get('pairs'), enabled=enabled)
+        except ValueError as error:     # SnapTapError
+            logger.warning('the Snap Tap in profile %r was not applied: %s',
+                           profile.get('name'), error)
+
     def rpc_profile_list(self, serial: str) -> list:
         return self.profiles.summaries(self._device(serial).serial)
 
     def rpc_profile_save(self, serial: str, name: str) -> dict:
         device = self._device(serial)
+        capture_current(device, self.persistence)
         try:
             entry = self.profiles.put(
-                device.serial, name, snapshot(device, self.persistence))
+                device.serial, name, self._snapshot(device), activate=True)
         except ProfileError as error:
             raise RpcError(INVALID_PARAMS, str(error)) from error
         return {'name': entry['name'], 'saved': entry['saved']}
+
+    def _switch(self, device, profile: dict) -> None:
+        """Put `profile` on `device` and make it the one the device follows."""
+        with self._lock:
+            try:
+                apply_profile(device, self.persistence, profile)
+                if self.effects is not None:
+                    # A profile saved with a host-drawn effect brings it back; one
+                    # saved without stops whatever is running, or it would paint
+                    # over the profile's own lighting.
+                    if (profile.get('device') or {}).get('software'):
+                        self.effects.restore(device)
+                    else:
+                        self.effects.stop_for(device)
+                self._apply_snaptap(device, profile)
+            except NotSupported as error:
+                raise RpcError(NOT_SUPPORTED, str(error)) from error
+            except (DeviceError, RecipeError) as error:
+                raise RpcError(DEVICE_ERROR, str(error)) from error
+            finally:
+                # Even when a step above failed: apply_profile writes persistence
+                # before it touches the device, so what the daemon keeps is this
+                # profile's by now.  Left following the previous one, the next
+                # change would save that mixture into it.
+                self.persistence.save()
+                self.profiles.activate(device.serial, profile['name'])
 
     def rpc_profile_load(self, serial: str, name: str) -> dict:
         device = self._device(serial)
@@ -484,22 +592,21 @@ class DaemonService:
             profile = self.profiles.get(device.serial, name)
         except ProfileError as error:
             raise RpcError(INVALID_PARAMS, str(error)) from error
-        try:
-            apply_profile(device, self.persistence, profile)
-        except NotSupported as error:
-            raise RpcError(NOT_SUPPORTED, str(error)) from error
-        except (DeviceError, RecipeError) as error:
-            raise RpcError(DEVICE_ERROR, str(error)) from error
-        if self.effects is not None:
-            # A profile saved with a host-drawn effect brings it back; one saved
-            # without stops whatever is running, or it would paint over the
-            # profile's own lighting.
-            if (profile.get('device') or {}).get('software'):
-                self.effects.restore(device)
-            else:
-                self.effects.stop_for(device)
-        self.persistence.save()
+        self._switch(device, profile)
         return {'name': profile['name']}
+
+    def rpc_profile_create(self, serial: str, name: str, source: Optional[str] = None) -> dict:
+        """A new profile, from the defaults or as a copy of `source`, switched to at once."""
+        device = self._device(serial)
+        capture_current(device, self.persistence)
+        try:
+            state = self._snapshot(device, new=True) if source is None else (
+                self.profiles.get(device.serial, source))
+            entry = self.profiles.put(device.serial, name, state, replace=False)
+        except ProfileError as error:
+            raise RpcError(INVALID_PARAMS, str(error)) from error
+        self._switch(device, entry)
+        return {'name': entry['name'], 'saved': entry['saved']}
 
     def rpc_profile_delete(self, serial: str, name: str) -> dict:
         device = self._device(serial)
@@ -615,9 +722,12 @@ class DaemonServer(socketserver.ThreadingTCPServer):
             'effect.status': service.rpc_effect_status,
             'integration.status': service.rpc_integration_status,
             'integration.set': service.rpc_integration_set,
+            'snaptap.status': service.rpc_snaptap_status,
+            'snaptap.set': service.rpc_snaptap_set,
             'profile.list': service.rpc_profile_list,
             'profile.save': service.rpc_profile_save,
             'profile.load': service.rpc_profile_load,
+            'profile.create': service.rpc_profile_create,
             'profile.delete': service.rpc_profile_delete,
             'keys.status': service.rpc_keys_status,
             'macro.list': service.rpc_macro_list,
@@ -636,6 +746,24 @@ class DaemonServer(socketserver.ThreadingTCPServer):
     @property
     def stopping(self) -> bool:
         return self._shutdown_requested.is_set()
+
+
+def device_loop(service: 'DaemonService', stop: threading.Event) -> None:
+    """Set devices up, then poll until `stop`: the first time at once, radio included."""
+    try:
+        service.start()
+    except Exception:  # noqa: BLE001 - the daemon keeps serving regardless
+        logger.exception('setting up devices failed')
+        service.state = 'ready'
+    logger.info('%d device(s) ready', len(service.manager.devices))
+    interval = 0
+    while not stop.wait(interval):
+        try:
+            service.poll_hotplug()
+        except Exception:  # noqa: BLE001 - a bad scan must not kill the daemon
+            logger.debug('hot-plug scan failed', exc_info=True)
+        service.first_sweep_pending = False
+        interval = HOTPLUG_INTERVAL
 
 
 def serve(backend=None, host: str = '127.0.0.1', port: int = 0,
@@ -664,20 +792,8 @@ def serve(backend=None, host: str = '127.0.0.1', port: int = 0,
 
     stop = threading.Event()
 
-    def device_loop() -> None:
-        try:
-            service.start()
-        except Exception:  # noqa: BLE001 - the daemon keeps serving regardless
-            logger.exception('setting up devices failed')
-            service.state = 'ready'
-        logger.info('%d device(s) ready', len(service.manager.devices))
-        while not stop.wait(HOTPLUG_INTERVAL):
-            try:
-                service.poll_hotplug()
-            except Exception:  # noqa: BLE001 - a bad scan must not kill the daemon
-                logger.debug('hot-plug scan failed', exc_info=True)
-
-    watcher = threading.Thread(target=device_loop, name='devices', daemon=True)
+    watcher = threading.Thread(target=device_loop, args=(service, stop), name='devices',
+                               daemon=True)
     watcher.start()
 
     try:

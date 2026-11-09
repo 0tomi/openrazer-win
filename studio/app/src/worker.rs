@@ -65,6 +65,8 @@ pub struct Detail {
     pub idle_time: Option<i64>,
     pub low_battery: Option<f64>,
     pub game_mode: Option<bool>,
+    /// "typing" or "gaming", on a keyboard that has the choice.
+    pub keyswitch: Option<String>,
     pub brightness: HashMap<String, f64>,
     pub profiles: Vec<Value>,
     pub macros: Option<Value>,
@@ -107,6 +109,11 @@ pub struct Snapshot {
     pub unsupported: Vec<(u16, String)>,
     /// The daemon's integrations: the accent colour, Chroma games.
     pub integrations: Value,
+    /// Snap Tap, as the daemon has it.
+    pub snaptap: Value,
+    /// Why the daemon refused the last change to the programs Snap Tap stays
+    /// out of. The panel shows it under the box, where the name was typed.
+    pub snaptap_deny_error: Option<String>,
 }
 
 pub enum Command {
@@ -119,6 +126,8 @@ pub enum Command {
     /// `quiet` for the automatic switch, which should not pop a toast every
     /// time a game comes to the front.
     Profile { action: &'static str, serial: String, name: String, quiet: bool },
+    /// A new profile, from the defaults or as a copy of `source`, switched to.
+    ProfileCreate { serial: String, name: String, source: Option<String> },
     MacroSet { serial: String, key: String, action: Value },
     MacroDelete { serial: String, key: String },
     MacroRecordStart { serial: String, key: String },
@@ -135,6 +144,8 @@ pub enum Command {
     CloseSynapse,
     /// Switch one of the daemon's integrations on or off.
     Integration { name: String, enabled: bool },
+    /// Change Snap Tap: whichever of `snaptap.set`'s parameters are given.
+    SnapTap(Value),
 }
 
 /// What to re-read after a call succeeds.
@@ -152,6 +163,9 @@ pub type Shared = Arc<Mutex<Snapshot>>;
 
 pub fn spawn(shared: Shared, repaint: impl Fn() + Send + 'static) -> Sender<Command> {
     let (tx, rx) = std::sync::mpsc::channel();
+    // Studio is how most people start the daemon. Queued before the thread
+    // exists, so it runs ahead of the first poll.
+    let _ = tx.send(Command::StartDaemon);
     std::thread::Builder::new()
         .name("daemon".into())
         .spawn(move || {
@@ -239,6 +253,7 @@ impl Worker {
         let keys = self.with(|c| c.call("keys.status", json!({}))).unwrap_or(Value::Null);
         let effects = self.with(|c| c.call("effect.status", json!({}))).unwrap_or(Value::Null);
         let integrations = self.with(|c| c.call("integration.status", json!({}))).unwrap_or(Value::Null);
+        let snaptap = self.with(|c| c.call("snaptap.status", json!({}))).unwrap_or(Value::Null);
         let devices: Vec<Device> = devices.as_array().map(|rows| rows.iter().map(parse_device).collect()).unwrap_or_default();
         let software = effects
             .get("active")
@@ -259,6 +274,7 @@ impl Worker {
             shared.software = software;
             shared.software_options = software_options;
             shared.integrations = integrations;
+            shared.snaptap = snaptap;
             let new = devices.iter().filter(|d| first || !shared.details.contains_key(&d.serial)).map(|d| d.serial.clone()).collect();
             shared.devices = devices;
             new
@@ -415,6 +431,28 @@ impl Worker {
                 self.update(serial, |d| d.game_mode = on.as_bool());
             }
         }
+        if caps["keyswitch_optimization"] == true {
+            if let Ok(mode) = self.with(|c| c.device(serial, "get_keyswitch_optimization", vec![], None)) {
+                self.update(serial, |d| d.keyswitch = mode.as_str().map(str::to_string));
+            }
+        }
+    }
+
+    /// Read back what switching profiles changed on the device.
+    fn after_switch(&mut self, serial: &str) {
+        if let Some(caps) = self.caps(serial) {
+            // A profile switches more than the lighting: the keyswitch mode,
+            // DPI and polling rate, and Snap Tap.
+            self.read_lighting(serial, &caps);
+            self.read_performance(serial, &caps);
+            self.read_keyboard(serial, &caps);
+        }
+        if let Ok(status) = self.with(|c| c.call("snaptap.status", json!({}))) {
+            self.shared.lock().unwrap().snaptap = status;
+        }
+        // Last: the new generation is what has the page take up the values
+        // just read, so they have to be there first.
+        self.load_persistence();
     }
 
     fn read_profiles(&mut self, serial: &str) {
@@ -499,11 +537,23 @@ impl Worker {
                 // The accent colour, just put on every device.
                 self.load_persistence();
             }
+            Command::SnapTap(params) => {
+                let deny = params.get("deny").is_some();
+                let result = self.with(|c| c.call("snaptap.set", params));
+                // A refused program name is shown under its box, anything else as a toast.
+                let error = if deny { result.as_ref().err().map(ToString::to_string) } else { self.report(&result, None); None };
+                let mut shared = self.shared.lock().unwrap();
+                if deny {
+                    shared.snaptap_deny_error = error;
+                }
+                if let Ok(status) = result {
+                    shared.snaptap = status;
+                }
+            }
             Command::Profile { action, serial, name, quiet } => {
                 let method = format!("profile.{action}");
                 let result = self.with(|c| c.call(&method, json!({ "serial": serial, "name": name })));
                 let text = match action {
-                    "save" => tf("Profile “{}” saved", &[&name]),
                     "load" => tf("Profile “{}” applied", &[&name]),
                     _ => tf("Profile “{}” deleted", &[&name]),
                 };
@@ -516,11 +566,16 @@ impl Worker {
                 }
                 self.read_profiles(&serial);
                 if action == "load" {
-                    self.load_persistence();
-                    if let Some(caps) = self.caps(&serial) {
-                        self.read_lighting(&serial, &caps);
-                    }
+                    self.after_switch(&serial);
                 }
+            }
+            Command::ProfileCreate { serial, name, source } => {
+                let result = self.with(|c| c.call("profile.create", json!({ "serial": serial, "name": name, "source": source })));
+                self.report(&result, Some(tf("Profile “{}” created", &[&name])));
+                self.read_profiles(&serial);
+                // Even after an error: the profile may have been made and
+                // switched to half way, and the page should show what is there.
+                self.after_switch(&serial);
             }
             Command::MacroSet { serial, key, action } => {
                 let result = self.with(|c| c.call("macro.set", json!({ "serial": serial, "key": key, "action": action })));
